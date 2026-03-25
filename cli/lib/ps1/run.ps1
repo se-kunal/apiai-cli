@@ -742,7 +742,7 @@ function Assert-Deps {
                     break
                 }
             }
-            throw ($failedPkg ?? "pip install failed")
+            if ($failedPkg) { throw $failedPkg } else { throw "pip install failed" }
         }
 
         Stop-SpinnerInline -Success $true -Message "Dependencies installed"
@@ -816,7 +816,8 @@ function Stop-Server {
 
     if (-not $stopped) {
         # Fallback  find uvicorn processes owned by our venv only
-        $venvAbsolute = (Resolve-Path $global:VENV_DIR -ErrorAction SilentlyContinue)?.Path
+        $resolvedVenv = Resolve-Path $global:VENV_DIR -ErrorAction SilentlyContinue
+        $venvAbsolute = if ($resolvedVenv) { $resolvedVenv.Path } else { $null }
         if ($venvAbsolute) {
             Get-Process -Name "python", "uvicorn" -ErrorAction SilentlyContinue | Where-Object {
                 try {
