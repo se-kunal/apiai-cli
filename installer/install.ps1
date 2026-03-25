@@ -143,7 +143,7 @@ if not exist ".apiai" (
 )
 
 :: Hand off to PowerShell runtime
-powershell -NoProfile -NonInteractive -ExecutionPolicy Bypass ^
+powershell -NoProfile -ExecutionPolicy Bypass ^
     -File "!PS1_ENTRY!" ^
     -ProjectRoot "%CD%" ^
     %*

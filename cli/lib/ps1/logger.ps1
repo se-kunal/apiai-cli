@@ -1,61 +1,43 @@
-# ================================================================
-#  API.AI  |  Logger  |  lib/logger.ps1
-#  Writes structured error logs. Never shows raw errors to user.
-#  Every exception lands here, not on screen.
-# ================================================================
+$global:LOG_DIR = Join-Path $global:PROJECT_ROOT "logs"
+$global:SESSION_META = @{}
 
-$global:LOG_DIR      = Join-Path $global:PROJECT_ROOT "logs"
-$global:SESSION_META = @{}   # populated at boot by detector
-
-# ----------------------------------------------------------------
-# INIT  — ensure log dir exists
-# ----------------------------------------------------------------
 function Initialize-Logger {
     if (-not (Test-Path $global:LOG_DIR)) {
         New-Item -ItemType Directory -Path $global:LOG_DIR -Force | Out-Null
     }
 }
 
-# ----------------------------------------------------------------
-# WRITE ERROR LOG
-# Returns the full path of the created log file
-# ----------------------------------------------------------------
 function Write-ErrorLog {
     param(
-        [string]$Step,           # which step failed
-        [string]$HumanMessage,   # what we told the user
-        [object]$Exception,      # the raw exception or error string
+        [string]$Step,
+        [string]$HumanMessage,
+        [object]$Exception,
         [hashtable]$ExtraContext = @{}
     )
 
     Initialize-Logger
 
-    # Build timestamp — used in filename and inside log
-    $ts        = Get-Date -Format "yyyyMMdd-HHmmss"
-    $tsHuman   = Get-Date -Format "yyyy-MM-dd HH:mm:ss"
-    $fileName  = "apiai-error-$ts"
-    $filePath  = Join-Path $global:LOG_DIR $fileName
+    $ts = Get-Date -Format "yyyyMMdd-HHmmss"
+    $tsHuman = Get-Date -Format "yyyy-MM-dd HH:mm:ss"
+    $filePath = Join-Path $global:LOG_DIR ("apiai-error-{0}.log" -f $ts)
 
-    # ---- Collect environment snapshot ----
     $envSnapshot = @{}
-    $safeKeys    = @('PATH','USERPROFILE','COMPUTERNAME','OS','PROCESSOR_ARCHITECTURE',
-                     'PYTHON_VERSION','VIRTUAL_ENV','CONDA_DEFAULT_ENV','TERM',
-                     'WT_SESSION','PSModulePath')
+    $safeKeys = @(
+        "PATH", "USERPROFILE", "COMPUTERNAME", "OS", "PROCESSOR_ARCHITECTURE",
+        "PYTHON_VERSION", "VIRTUAL_ENV", "CONDA_DEFAULT_ENV", "TERM",
+        "WT_SESSION", "PSModulePath"
+    )
     foreach ($k in $safeKeys) {
         $val = [System.Environment]::GetEnvironmentVariable($k)
         if ($val) { $envSnapshot[$k] = $val }
     }
-
-    # Redact anything that looks like a secret in PATH
-    if ($envSnapshot['PATH']) {
-        $envSnapshot['PATH'] = "[present — redacted for length]"
+    if ($envSnapshot["PATH"]) {
+        $envSnapshot["PATH"] = "[present - redacted for length]"
     }
 
-    # ---- Build the log content ----
     $lines = [System.Collections.Generic.List[string]]::new()
-
-    $border  = "=" * 64
-    $divider = "-" * 64
+    $border = ("=" * 64)
+    $divider = ("-" * 64)
 
     $lines.Add($border)
     $lines.Add("  API.AI  |  Error Report")
@@ -70,9 +52,8 @@ function Write-ErrorLog {
     $lines.Add($divider)
     $lines.Add("")
 
-    # Session meta (populated by detector)
-    foreach ($key in $global:SESSION_META.Keys | Sort-Object) {
-        $lines.Add("  $($key.PadRight(22)): $($global:SESSION_META[$key])")
+    foreach ($key in ($global:SESSION_META.Keys | Sort-Object)) {
+        $lines.Add(("  {0}: {1}" -f $key.PadRight(22), $global:SESSION_META[$key]))
     }
 
     $lines.Add("")
@@ -86,7 +67,6 @@ function Write-ErrorLog {
     $lines.Add("  Script Root        : $global:SCRIPT_ROOT")
     $lines.Add("")
 
-    # ---- Exception detail ----
     $lines.Add($divider)
     $lines.Add("  EXCEPTION")
     $lines.Add($divider)
@@ -102,80 +82,73 @@ function Write-ErrorLog {
         $lines.Add("")
         $st = $Exception.ScriptStackTrace
         if ($st) {
-            foreach ($stLine in $st -split "`n") {
+            foreach ($stLine in ($st -split "`n")) {
                 $lines.Add("    $($stLine.TrimEnd())")
             }
         }
-        if ($Exception.Exception.InnerException) {
-            $lines.Add("")
-            $lines.Add("  Inner Exception:")
-            $lines.Add("    $($Exception.Exception.InnerException.Message)")
-        }
-    } elseif ($Exception -is [System.Exception]) {
+    }
+    elseif ($Exception -is [System.Exception]) {
         $lines.Add("  Type    : $($Exception.GetType().FullName)")
         $lines.Add("  Message : $($Exception.Message)")
         $lines.Add("")
         $lines.Add("  Stack Trace:")
         $lines.Add("")
-        foreach ($stLine in ($Exception.StackTrace -split "`n")) {
-            $lines.Add("    $($stLine.TrimEnd())")
+        foreach ($stLine in (($Exception.StackTrace | Out-String) -split "`n")) {
+            if ($stLine.Trim()) { $lines.Add("    $($stLine.TrimEnd())") }
         }
-    } else {
+    }
+    else {
         $lines.Add("  Raw:")
         $lines.Add("")
         $lines.Add("    $Exception")
     }
-
     $lines.Add("")
 
-    # ---- Extra context ----
     if ($ExtraContext.Count -gt 0) {
         $lines.Add($divider)
         $lines.Add("  EXTRA CONTEXT")
         $lines.Add($divider)
         $lines.Add("")
-        foreach ($k in $ExtraContext.Keys | Sort-Object) {
-            $lines.Add("  $($k.PadRight(22)): $($ExtraContext[$k])")
+        foreach ($k in ($ExtraContext.Keys | Sort-Object)) {
+            $lines.Add(("  {0}: {1}" -f $k.PadRight(22), $ExtraContext[$k]))
         }
         $lines.Add("")
     }
 
-    # ---- Environment snapshot ----
     $lines.Add($divider)
     $lines.Add("  ENVIRONMENT VARIABLES (selected)")
     $lines.Add($divider)
     $lines.Add("")
-    foreach ($k in $envSnapshot.Keys | Sort-Object) {
-        $lines.Add("  $($k.PadRight(28)): $($envSnapshot[$k])")
+    foreach ($k in ($envSnapshot.Keys | Sort-Object)) {
+        $lines.Add(("  {0}: {1}" -f $k.PadRight(28), $envSnapshot[$k]))
     }
     $lines.Add("")
 
-    # ---- Checksum state ----
     if ($global:CHECKSUM_STATE) {
         $lines.Add($divider)
         $lines.Add("  CHECKSUM STATE AT FAILURE")
         $lines.Add($divider)
         $lines.Add("")
-        foreach ($k in $global:CHECKSUM_STATE.Keys | Sort-Object) {
-            $lines.Add("  $($k.PadRight(28)): $($global:CHECKSUM_STATE[$k])")
+        foreach ($k in ($global:CHECKSUM_STATE.Keys | Sort-Object)) {
+            $lines.Add(("  {0}: {1}" -f $k.PadRight(28), $global:CHECKSUM_STATE[$k]))
         }
         $lines.Add("")
     }
 
-    # ---- Directory snapshot ----
     $lines.Add($divider)
     $lines.Add("  DIRECTORY SNAPSHOT")
     $lines.Add($divider)
     $lines.Add("")
     try {
         $items = Get-ChildItem -Path $global:PROJECT_ROOT -Depth 1 -ErrorAction SilentlyContinue |
-                 Where-Object { $_.Name -notmatch '^\.venv$|^node_modules$|^__pycache__$' } |
-                 Select-Object Name, Length, LastWriteTime
+            Where-Object { $_.Name -notmatch '^\.venv$|^node_modules$|^__pycache__$' } |
+            Select-Object Name, Length, LastWriteTime
         foreach ($item in $items) {
-            $size = if ($item.Length) { "$([math]::Round($item.Length/1KB, 1)) KB" } else { "<dir>" }
-            $lines.Add("  $($item.Name.PadRight(32)) $($size.PadRight(12)) $($item.LastWriteTime.ToString('yyyy-MM-dd HH:mm'))")
+            $size = if ($item.Length) { "{0} KB" -f [math]::Round($item.Length / 1KB, 1) } else { "<dir>" }
+            $lines.Add(("  {0} {1} {2}" -f $item.Name.PadRight(32), $size.PadRight(12), $item.LastWriteTime.ToString("yyyy-MM-dd HH:mm")))
         }
-    } catch {
+    }
+    catch {
         $lines.Add("  [Could not list directory]")
     }
     $lines.Add("")
@@ -183,19 +156,15 @@ function Write-ErrorLog {
     $lines.Add("  End of report  |  API.AI v$global:APP_VERSION")
     $lines.Add($border)
 
-    # ---- Write to file ----
     try {
         $lines | Set-Content -Path $filePath -Encoding UTF8 -Force
         return $filePath
-    } catch {
-        # If we can't write the log, return null — caller handles this gracefully
+    }
+    catch {
         return $null
     }
 }
 
-# ----------------------------------------------------------------
-# SAFE INVOKE  — wraps any script block, logs on failure
-# ----------------------------------------------------------------
 function Invoke-Safe {
     param(
         [string]$Step,
@@ -207,12 +176,9 @@ function Invoke-Safe {
     try {
         & $Action
         return $true
-    } catch {
-        $logFile = Write-ErrorLog -Step $Step `
-                                  -HumanMessage $HumanMessage `
-                                  -Exception $_ `
-                                  -ExtraContext $ExtraContext
-
+    }
+    catch {
+        $logFile = Write-ErrorLog -Step $Step -HumanMessage $HumanMessage -Exception $_ -ExtraContext $ExtraContext
         Write-ErrorMoment -HumanMessage $HumanMessage -LogFile $logFile
         return $false
     }

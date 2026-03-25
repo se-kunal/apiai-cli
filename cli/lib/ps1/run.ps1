@@ -1,17 +1,18 @@
 # ================================================================
 #  API.AI  |  Main Orchestrator  |  run.ps1
 #  Entry point for the PowerShell experience.
-#  Dot-sourced from run.bat after environment detection.
+#  Invoked by the api.bat launcher after environment detection.
 # ================================================================
 
 #Requires -Version 5.1
-[Console]::OutputEncoding = [System.Text.Encoding]::UTF8
 
 param(
     [string]$ProjectRoot = "",   # passed by the npm CLI launcher
     [Parameter(ValueFromRemainingArguments)]
     [string[]]$RemainingArgs
 )
+
+[Console]::OutputEncoding = [System.Text.Encoding]::UTF8
 
 # Re-expose remaining args as $args for the rest of the script
 $PSBoundParameters.Remove('ProjectRoot') | Out-Null
@@ -89,45 +90,14 @@ Register-CleanExit
 # ----------------------------------------------------------------
 $null = Invoke-Detection
 
-# ----------------------------------------------------------------
-# COMMAND ROUTING
-# ----------------------------------------------------------------
-$CMD = if ($RemainingArgs -and $RemainingArgs[0]) { $RemainingArgs[0].ToLower() } else { "" }
-
-# Smart default: no args = agentic decision
-if ($CMD -eq "") {
-    $CMD = Get-SmartDefault
-}
-
-switch ($CMD) {
-    "start" { Invoke-Start }
-    "install" { Invoke-Install }
-    "clean" { Invoke-Clean }
-    "doctor" { Invoke-Doctor }
-    "restart" { Invoke-Restart }
-    "help" { Show-Help }
-    default {
-        Write-Banner "Runtime CLI"
-        Write-Blank
-        Write-Color $global:C.Warn "  Unknown command: $CMD"
-        Write-Blank
-        Show-Help
-    }
-}
+$script:INITIAL_CMD = if ($RemainingArgs -and $RemainingArgs[0]) { $RemainingArgs[0].ToLower() } else { "" }
 
 # ================================================================
 #  SMART DEFAULT   agentic decision when no command given
 # ================================================================
 function Get-SmartDefault {
-    # Check if server is already running (PID file exists and process is live)
-    if (Test-Path $global:PID_FILE) {
-        try {
-            $savedPid = Get-Content $global:PID_FILE -Raw
-            $proc = Get-Process -Id ([int]$savedPid) -ErrorAction SilentlyContinue
-            if ($proc) { return "running" }
-        }
-        catch {}
-    }
+    $serverState = Get-RunningServerState
+    if ($serverState.Running) { return "running" }
 
     # Check if venv and deps exist
     $venvReady = Test-Path (Join-Path $global:VENV_DIR "Scripts\python.exe")
@@ -190,26 +160,32 @@ function Invoke-Start {
     }
 
     # Check if already running
-    if (Test-Path $global:PID_FILE) {
-        try {
-            $existingPid = Get-Content $global:PID_FILE -Raw
-            $proc = Get-Process -Id ([int]$existingPid) -ErrorAction SilentlyContinue
-            if ($proc) {
-                Write-Status "Server already running on port $port (PID $existingPid)" -State warn
-                $answer = Ask-YesNo "Stop the existing server and restart?" -Default $true
-                if ($answer) {
-                    Stop-Server
-                }
-                else {
-                    Write-Blank
-                    Write-Color $global:C.Info "  Opening existing server..."
-                    Start-Process "http://localhost:$port/docs" -ErrorAction SilentlyContinue
-                    Exit-Gracefully 0
-                    return
-                }
+    $runningState = Get-RunningServerState
+    if ($runningState.Running) {
+        $existingPort = if ($runningState.Port) { $runningState.Port } else { $global:PORT_START }
+        Write-Status "Server already running on port $existingPort (PID $($runningState.Pid))" -State warn
+        $answer = Ask-YesNo "Stop the existing server and restart?" -Default $true
+        if ($answer) {
+            Stop-Server
+            Start-Sleep -Milliseconds 300
+            $port = Resolve-Port
+            if ($null -eq $port) {
+                $logFile = Write-ErrorLog -Step "Port Resolution" `
+                    -HumanMessage "No free ports available after stopping server" `
+                    -Exception "All ports $($global:PORT_START)-$($global:PORT_END) in use"
+                Write-ErrorMoment -HumanMessage "All ports between $($global:PORT_START) and $($global:PORT_END) are in use." `
+                    -LogFile $logFile
+                Exit-Gracefully 1
+                return
             }
         }
-        catch {}
+        else {
+            Write-Blank
+            Write-Color $global:C.Info "  Opening existing server..."
+            Start-Process "http://localhost:$existingPort/docs" -ErrorAction SilentlyContinue
+            Exit-Gracefully 0
+            return
+        }
     }
 
     Write-Status "Port $port is available" -State ok
@@ -230,20 +206,19 @@ function Invoke-Start {
     Start-Sleep -Milliseconds 600
     Stop-SpinnerInline -Success $true -Message "Server initializing"
 
-    # Write PID placeholder  uvicorn will be the actual process
-    # We track the job instead
+    # Clear stale pid state before launching a fresh server process.
+    Clear-PidState
     Write-LaunchBox -Port $port -AppName $global:APP_NAME -Version $global:APP_VERSION
 
     # Run uvicorn  this blocks until Ctrl+C
     $uvicorn = Join-Path $global:VENV_DIR "Scripts\uvicorn.exe"
-    $appObj = "$($global:APP_OBJECT):app"
-
     try {
         $mainModule = [System.IO.Path]::GetFileNameWithoutExtension($global:MAIN_FILE); & $uvicorn "$mainModule`:$($global:APP_OBJECT)" --host 0.0.0.0 --port $port --reload 2>&1 | ForEach-Object {
             # Filter uvicorn output  show only meaningful lines
             $line = $_.ToString()
             if ($line -match "Application startup complete") {
                 Write-Status "Application startup complete" -State ok
+                Save-RunningPidState -Port $port
             }
             elseif ($line -match "ERROR|error") {
                 # Capture uvicorn errors for log
@@ -261,7 +236,7 @@ function Invoke-Start {
     }
     finally {
         # Clean up PID file
-        if (Test-Path $global:PID_FILE) { Remove-Item $global:PID_FILE -Force -ErrorAction SilentlyContinue }
+        Clear-PidState
         Show-Cursor
     }
 
@@ -272,8 +247,12 @@ function Invoke-Start {
 #  SETUP AND START   agentic: install then start
 # ================================================================
 function Invoke-SetupAndStart {
-    Invoke-Install -Silent
-    Invoke-Start
+    $installed = Invoke-Install -Silent
+    if ($installed) {
+        Invoke-Start
+        return
+    }
+    Exit-Gracefully 1
 }
 
 # ================================================================
@@ -291,23 +270,38 @@ function Invoke-Install {
         $logFile = Write-ErrorLog -Step "Install / Self Check" `
             -HumanMessage "Required files missing: $missingList" `
             -Exception "Missing: $missingList"
-        Write-ErrorMoment -HumanMessage "Cannot install  required files are missing: $missingList" `
+        Write-ErrorMoment -HumanMessage "Cannot install: required files are missing: $missingList" `
             -LogFile $logFile
+        if ($Silent) { return $false }
         Exit-Gracefully 1
         return
     }
 
     Write-Section "Environment Setup"
 
-    if (-not (Assert-Python)) { Exit-Gracefully 1; return }
-    if (-not (Assert-Venv)) { Exit-Gracefully 1; return }
-    if (-not (Assert-Deps)) { Exit-Gracefully 1; return }
+    if (-not (Assert-Python)) {
+        if ($Silent) { return $false }
+        Exit-Gracefully 1
+        return
+    }
+    if (-not (Assert-Venv)) {
+        if ($Silent) { return $false }
+        Exit-Gracefully 1
+        return
+    }
+    if (-not (Assert-Deps)) {
+        if ($Silent) { return $false }
+        Exit-Gracefully 1
+        return
+    }
     Assert-EnvFile
 
     Update-State
 
+    if ($Silent) { return $true }
+
     Write-Blank
-    Write-Color $global:C.Success "  Environment is ready. Run  run.bat start  to launch."
+    Write-Color $global:C.Success "  Environment is ready. Run  api start  to launch."
     Write-Blank
     Exit-Gracefully 0
 }
@@ -352,7 +346,7 @@ function Invoke-Clean {
     }
 
     Write-Blank
-    Write-Color $global:C.Success "  Clean complete. Run  run.bat install  to set up again."
+    Write-Color $global:C.Success "  Clean complete. Run  api install  to set up again."
     Write-Blank
     Exit-Gracefully 0
 }
@@ -463,7 +457,7 @@ function Invoke-Doctor {
         }
     }
 
-    Run-Check "main.py" {
+    Run-Check "$($global:MAIN_FILE)" {
         $mainPath = Join-Path $global:PROJECT_ROOT $global:MAIN_FILE
         if (Test-Path $mainPath) {
             $content = Get-Content $mainPath -Raw -ErrorAction SilentlyContinue
@@ -515,13 +509,13 @@ function Invoke-Doctor {
     Write-Blank
 
     if ($failed -gt 0) {
-        Write-Color $global:C.Info "  Run  run.bat install  to attempt auto-repair."
+        Write-Color $global:C.Info "  Run  api install  to attempt auto-repair."
     }
     elseif ($warned -gt 0) {
         Write-Color $global:C.Info "  Warnings are non-critical but worth reviewing."
     }
     else {
-        Write-Color $global:C.Success "  Everything looks great. Run  run.bat start  to launch."
+        Write-Color $global:C.Success "  Everything looks great. Run  api start  to launch."
     }
 
     Write-Blank
@@ -545,16 +539,21 @@ function Invoke-Restart {
 # ================================================================
 function Invoke-Running {
     Write-Banner "Already Running"
-    try {
-        $savedPid = Get-Content $global:PID_FILE -Raw
-        $port = Resolve-Port   # we can't easily get the saved port, show nearest free
+    $serverState = Get-RunningServerState
+    if (-not $serverState.Running) {
+        Write-Status "No running server found" -State warn
+        Write-Blank
+        Write-Color $global:C.Info "  Starting your API instead..."
+        Start-Sleep -Milliseconds 250
+        Invoke-Start
+        return
     }
-    catch {}
 
-    Write-Status "Server is already running" -State ok
+    $port = if ($serverState.Port) { $serverState.Port } else { $global:PORT_START }
+    Write-Status "Server is already running (PID $($serverState.Pid), Port $port)" -State ok
     Write-Blank
     Write-Color $global:C.Cyan "  Opening docs in browser..."
-    try { Start-Process "http://localhost:$($global:PORT_START)/docs" } catch {}
+    try { Start-Process "http://localhost:$port/docs" } catch {}
     Exit-Gracefully 0
 }
 
@@ -578,8 +577,9 @@ function Show-Help {
         "",
         "  $($global:C.Muted)USAGE$($global:C.Reset)",
         "",
-        "  $($global:C.White)run.bat start$($global:C.Reset)",
-        "  $($global:C.White)run.bat doctor$($global:C.Reset)",
+        "  $($global:C.White)api start$($global:C.Reset)",
+        "  $($global:C.White)api doctor$($global:C.Reset)",
+        "  $($global:C.Muted)run.bat start  (legacy)$($global:C.Reset)",
         ""
     )
 
@@ -596,6 +596,146 @@ function Show-Help {
 # ================================================================
 #  UTILITIES
 # ================================================================
+
+function Read-PidState {
+    if (-not (Test-Path $global:PID_FILE)) {
+        return @{ Pid = $null; Port = $null }
+    }
+
+    try {
+        $raw = (Get-Content $global:PID_FILE -Raw -ErrorAction Stop).Trim()
+        if (-not $raw) { return @{ Pid = $null; Port = $null } }
+
+        # Backward compatibility: old format stored only the PID as plain text.
+        if ($raw -match '^\d+$') {
+            return @{ Pid = [int]$raw; Port = $null }
+        }
+
+        $obj = $raw | ConvertFrom-Json -AsHashtable -ErrorAction Stop
+        $pidValue = $null
+        $portValue = $null
+        if ($obj.ContainsKey("pid")) {
+            try { $pidValue = [int]$obj["pid"] } catch { $pidValue = $null }
+        }
+        if ($obj.ContainsKey("port")) {
+            try { $portValue = [int]$obj["port"] } catch { $portValue = $null }
+        }
+        return @{ Pid = $pidValue; Port = $portValue }
+    }
+    catch {
+        return @{ Pid = $null; Port = $null }
+    }
+}
+
+function Write-PidState([int]$ProcessId, [int]$Port = 0) {
+    try {
+        $payload = @{
+            pid = $ProcessId
+            port = if ($Port -gt 0) { $Port } else { $null }
+            updated_at = (Get-Date).ToString("o")
+        }
+        $payload | ConvertTo-Json -Depth 3 | Set-Content -Path $global:PID_FILE -Encoding UTF8 -Force
+    }
+    catch {}
+}
+
+function Clear-PidState {
+    if (Test-Path $global:PID_FILE) {
+        Remove-Item $global:PID_FILE -Force -ErrorAction SilentlyContinue
+    }
+}
+
+function Get-PortByPid([int]$ProcessId) {
+    if (-not $ProcessId) { return $null }
+
+    try {
+        if (Get-Command Get-NetTCPConnection -ErrorAction SilentlyContinue) {
+            $conn = Get-NetTCPConnection -OwningProcess $ProcessId -State Listen -ErrorAction SilentlyContinue |
+                Where-Object { $_.LocalPort -ge $global:PORT_START -and $_.LocalPort -le $global:PORT_END } |
+                Select-Object -First 1
+            if ($conn) { return [int]$conn.LocalPort }
+        }
+    }
+    catch {}
+
+    try {
+        $portLine = netstat -ano 2>$null | Select-String "LISTENING\s+$ProcessId$" | Select-Object -First 1
+        if ($portLine -and ($portLine.ToString() -match ':(\d+)\s+')) {
+            $parsedPort = [int]$matches[1]
+            if ($parsedPort -ge $global:PORT_START -and $parsedPort -le $global:PORT_END) {
+                return $parsedPort
+            }
+        }
+    }
+    catch {}
+
+    return $null
+}
+
+function Find-ApiServerPids {
+    $pids = @()
+    $moduleName = [System.IO.Path]::GetFileNameWithoutExtension($global:MAIN_FILE)
+    $moduleToken = "$moduleName`:$($global:APP_OBJECT)"
+    $resolvedVenv = Resolve-Path $global:VENV_DIR -ErrorAction SilentlyContinue
+    $venvAbsolute = if ($resolvedVenv) { $resolvedVenv.Path } else { $null }
+
+    foreach ($proc in (Get-Process -Name "python", "uvicorn" -ErrorAction SilentlyContinue)) {
+        try {
+            $cmd = (Get-CimInstance Win32_Process -Filter "ProcessId=$($proc.Id)" -ErrorAction SilentlyContinue).CommandLine
+            if (-not $cmd) {
+                $cmd = (Get-WmiObject Win32_Process -Filter "ProcessId=$($proc.Id)" -ErrorAction SilentlyContinue).CommandLine
+            }
+            if (-not $cmd) { continue }
+
+            $hasUvicorn = $cmd -match 'uvicorn'
+            $fromVenv = $venvAbsolute -and ($cmd -match [regex]::Escape($venvAbsolute))
+            $fromProject = $cmd -match [regex]::Escape($global:PROJECT_ROOT)
+            $matchesModule = $cmd -match [regex]::Escape($moduleToken)
+
+            if ($hasUvicorn -and ($fromVenv -or ($fromProject -and $matchesModule))) {
+                $pids += [int]$proc.Id
+            }
+        }
+        catch {}
+    }
+
+    return @($pids | Select-Object -Unique)
+}
+
+function Save-RunningPidState([int]$Port = 0) {
+    $livePids = Find-ApiServerPids
+    if ($livePids.Count -gt 0) {
+        Write-PidState -ProcessId ([int]$livePids[0]) -Port $Port
+    }
+}
+
+function Get-RunningServerState {
+    $pidState = Read-PidState
+    $savedPid = $pidState.Pid
+    $port = $pidState.Port
+
+    if ($savedPid) {
+        $proc = Get-Process -Id $savedPid -ErrorAction SilentlyContinue
+        if ($proc) {
+            if (-not $port) {
+                $port = Get-PortByPid -ProcessId $savedPid
+                Write-PidState -ProcessId $savedPid -Port $port
+            }
+            return @{ Running = $true; Pid = $savedPid; Port = $port }
+        }
+    }
+
+    $livePids = Find-ApiServerPids
+    if ($livePids.Count -gt 0) {
+        $livePid = [int]$livePids[0]
+        $livePort = if ($port) { $port } else { Get-PortByPid -ProcessId $livePid }
+        Write-PidState -ProcessId $livePid -Port $livePort
+        return @{ Running = $true; Pid = $livePid; Port = $livePort }
+    }
+
+    if (Test-Path $global:PID_FILE) { Clear-PidState }
+    return @{ Running = $false; Pid = $null; Port = $null }
+}
 
 function Assert-Python {
     Start-SpinnerInline "Checking Python"
@@ -693,7 +833,7 @@ function Assert-Deps {
     # Network check before attempting install
     if (-not $global:NETWORK_OK) {
         Write-Status "Network unavailable  skipping dependency install" -State warn
-        Write-Color $global:C.Info "  Connect to the internet and run  run.bat install  to complete setup."
+        Write-Color $global:C.Info "  Connect to the internet and run  api install  to complete setup."
         return $true   # non-fatal  let the user try to start anyway
     }
 
@@ -798,38 +938,39 @@ function Stop-Server {
     Start-SpinnerInline "Stopping server"
     Start-Sleep -Milliseconds 300
 
-    $stopped = $false
+    $stoppedAny = $false
 
-    # Try PID file first  only kill OUR process
-    if (Test-Path $global:PID_FILE) {
+    $state = Get-RunningServerState
+    if ($state.Running -and $state.Pid) {
         try {
-            $savedPid = [int](Get-Content $global:PID_FILE -Raw)
-            $proc = Get-Process -Id $savedPid -ErrorAction SilentlyContinue
+            $proc = Get-Process -Id $state.Pid -ErrorAction SilentlyContinue
             if ($proc) {
-                $proc | Stop-Process -Force
-                $stopped = $true
+                $proc | Stop-Process -Force -ErrorAction SilentlyContinue
+                $stoppedAny = $true
             }
-            Remove-Item $global:PID_FILE -Force -ErrorAction SilentlyContinue
         }
         catch {}
     }
 
-    if (-not $stopped) {
-        # Fallback  find uvicorn processes owned by our venv only
-        $resolvedVenv = Resolve-Path $global:VENV_DIR -ErrorAction SilentlyContinue
-        $venvAbsolute = if ($resolvedVenv) { $resolvedVenv.Path } else { $null }
-        if ($venvAbsolute) {
-            Get-Process -Name "python", "uvicorn" -ErrorAction SilentlyContinue | Where-Object {
-                try {
-                    $cmd = (Get-WmiObject Win32_Process -Filter "ProcessId=$($_.Id)" -ErrorAction SilentlyContinue).CommandLine
-                    $cmd -and $cmd -match [regex]::Escape($venvAbsolute)
-                }
-                catch { $false }
-            } | Stop-Process -Force -ErrorAction SilentlyContinue
+    $livePids = Find-ApiServerPids
+    foreach ($candidatePid in $livePids) {
+        try {
+            $proc = Get-Process -Id ([int]$candidatePid) -ErrorAction SilentlyContinue
+            if ($proc) {
+                $proc | Stop-Process -Force -ErrorAction SilentlyContinue
+                $stoppedAny = $true
+            }
         }
+        catch {}
     }
 
-    Stop-SpinnerInline -Success $true -Message "Server stopped"
+    Clear-PidState
+    if ($stoppedAny) {
+        Stop-SpinnerInline -Success $true -Message "Server stopped"
+    }
+    else {
+        Stop-SpinnerInline -Success $true -Message "No running server found"
+    }
 }
 
 function Exit-Gracefully([int]$Code = 0) {
@@ -840,3 +981,29 @@ function Exit-Gracefully([int]$Code = 0) {
     }
     exit $Code
 }
+
+function Invoke-Main {
+    $cmd = $script:INITIAL_CMD
+    if ($cmd -eq "") { $cmd = Get-SmartDefault }
+
+    switch ($cmd) {
+        "start" { Invoke-Start }
+        "install" { Invoke-Install }
+        "clean" { Invoke-Clean }
+        "doctor" { Invoke-Doctor }
+        "restart" { Invoke-Restart }
+        "running" { Invoke-Running }
+        "setup-and-start" { Invoke-SetupAndStart }
+        "setup" { Invoke-SetupAndStart } # legacy alias
+        "help" { Show-Help }
+        default {
+            Write-Banner "Runtime CLI"
+            Write-Blank
+            Write-Color $global:C.Warn "  Unknown command: $cmd"
+            Write-Blank
+            Show-Help
+        }
+    }
+}
+
+Invoke-Main

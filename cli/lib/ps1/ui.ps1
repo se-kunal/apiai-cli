@@ -519,7 +519,7 @@ function Wait-AnyKey {
 # TRAP Ctrl+C  — clean exit, restore cursor
 # ----------------------------------------------------------------
 function Register-CleanExit {
-    [Console]::TreatControlCAsInput = $false
+    try { [Console]::TreatControlCAsInput = $false } catch {}
     $null = Register-EngineEvent -SourceIdentifier PowerShell.Exiting -Action {
         Show-Cursor
     }
