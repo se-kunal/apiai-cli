@@ -1,0 +1,30 @@
+# ================================================================
+#  .apiai — API.AI project configuration
+#  Place this file in your project root.
+#  All fields are optional — defaults are shown.
+# ================================================================
+
+# Human-readable name shown in the CLI banner
+name = My FastAPI Project
+
+# Version shown in the banner and launch box
+version = 1.0.0
+
+# Short description (shown in doctor output)
+description = A FastAPI REST API
+
+# Python entry point — the .py file that contains your FastAPI app
+# Default: main.py
+main = main.py
+
+# The FastAPI app variable name inside that file
+# Default: app   (i.e. app = FastAPI())
+app = app
+
+# Preferred port. The CLI will scan port through port+10 for a free one.
+# Default: 8000
+port = 8000
+
+# Minimum Python version required
+# Default: 3.8
+python = 3.8
